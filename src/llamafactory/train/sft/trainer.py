@@ -127,6 +127,49 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         if training_args.fp8 and hasattr(self, "accelerator"):  # verify FP8 status after trainer initialization
             verify_fp8_status(self.accelerator, training_args)
 
+        # Ulysses context parallelism (Gemma-4 long-context path).
+        # See /fsx/home/zijishi/.claude/plans/hashed-swinging-finch.md.
+        self.cp_group = None
+        self.cp_mesh = None
+        if finetuning_args.context_parallel_size > 1:
+            import torch.distributed as dist
+            from torch.distributed.device_mesh import init_device_mesh
+
+            from .cp_utils import set_cp_group
+
+            cp = finetuning_args.context_parallel_size
+            ws = dist.get_world_size()
+            self.cp_mesh = init_device_mesh("cuda", (ws // cp, cp), mesh_dim_names=("dp", "cp"))
+            self.cp_group = self.cp_mesh["cp"].get_group()
+            set_cp_group(self.cp_group)
+
+            cfg = self.model.config.get_text_config() if hasattr(self.model.config, "get_text_config") else self.model.config
+            n_heads = cfg.num_attention_heads
+            n_kv = cfg.num_key_value_heads
+            if n_heads % cp != 0:
+                raise ValueError(f"num_attention_heads ({n_heads}) not divisible by context_parallel_size ({cp}).")
+            if not (n_kv % cp == 0 or cp % n_kv == 0):
+                raise ValueError(
+                    f"num_key_value_heads ({n_kv}) is incompatible with context_parallel_size ({cp}): "
+                    "need n_kv % cp == 0 OR cp % n_kv == 0 (the latter replicates KV heads)."
+                )
+
+            # Swap triton_gqa -> triton_gqa_ulysses only if triton_gqa is the
+            # currently selected implementation. Non-Gemma models keep their own path.
+            from gemma_triton_flash_attn import register_triton_attention_ulysses
+
+            register_triton_attention_ulysses(self.cp_group, name="triton_gqa_ulysses")
+            if getattr(self.model.config, "_attn_implementation", None) == "triton_gqa":
+                self.model.config._attn_implementation = "triton_gqa_ulysses"
+            if hasattr(self.model.config, "text_config") and self.model.config.text_config is not None:
+                if getattr(self.model.config.text_config, "_attn_implementation", None) == "triton_gqa":
+                    self.model.config.text_config._attn_implementation = "triton_gqa_ulysses"
+
+            logger.info_rank0(
+                f"Context parallelism enabled: cp_size={cp}, dp_size={ws // cp}, "
+                f"attn_implementation=triton_gqa_ulysses."
+            )
+
     @override
     def create_optimizer(self) -> "torch.optim.Optimizer":
         if self.optimizer is None:
@@ -149,6 +192,9 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
 
     @override
     def compute_loss(self, model, inputs, *args, **kwargs):
+        if self.cp_group is not None:
+            return self._compute_loss_cp(model, inputs, *args, **kwargs)
+
         if self.finetuning_args.use_asft_loss:
             with torch.no_grad():
                 ref_outputs = self.ref_model(
@@ -160,6 +206,59 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
             return self.compute_loss_func(outputs, inputs["labels"], ref_logits)
         else:
             return super().compute_loss(model, inputs, *args, **kwargs)
+
+    def _compute_loss_cp(self, model, inputs, *args, **kwargs):
+        """CP-aware loss. Pads+splits inputs on the seq dim across `self.cp_group`,
+        runs the forward (attention does Ulysses all-to-all internally), and
+        reduces CE loss across CP ranks.
+
+        For Gemma-4 with `use_bidirectional_attention == "vision"`, the image-
+        group state is computed on the FULL seq BEFORE the split, otherwise
+        each rank's shard loses the group context. This path is a no-op when
+        the installed `gemma_triton_flash_attn` does not expose the vision-
+        group helpers (e.g., the cookbook build).
+        """
+        from .cp_utils import padding_and_split_data, sequence_parallel_loss_reduce
+
+        # (a) Compute Gemma-4 vision-group state on full seq pre-split, if applicable.
+        # The helpers only exist on the fork build of gemma_triton_flash_attn; on
+        # the cookbook build the import fails and we fall through (no-op).
+        token = None
+        image_group_state = None
+        try:
+            from gemma_triton_flash_attn.hf_integration import (
+                _compute_image_group_state,
+                _image_group_state as image_group_state,
+            )
+
+            mmt = inputs.get("mm_token_type_ids", None)
+            text_cfg = (
+                model.config.get_text_config() if hasattr(model.config, "get_text_config") else model.config
+            )
+            if getattr(text_cfg, "use_bidirectional_attention", None) == "vision" and mmt is not None:
+                token = image_group_state.set(_compute_image_group_state(mmt))
+        except ImportError:
+            pass
+
+        try:
+            # (b) Pad + split all rank-2+ tensors on last dim across cp_group.
+            inputs = padding_and_split_data(dict(inputs), self.cp_group, ignore_index=IGNORE_INDEX)
+
+            # (c) Forward. Pop labels so HF's model-internal loss isn't computed;
+            # we do the CP-aware reduce ourselves below.
+            labels = inputs.pop("labels")
+            outputs = model(**inputs)
+
+            # (d) Loss weights: 1.0 for supervised tokens, 0.0 for ignore_index.
+            loss_weights = (labels != IGNORE_INDEX).to(outputs.logits.dtype)
+            loss = sequence_parallel_loss_reduce(outputs.logits, labels, loss_weights, self.cp_group)
+
+            if kwargs.get("return_outputs", False):
+                return loss, outputs
+            return loss
+        finally:
+            if token is not None and image_group_state is not None:
+                image_group_state.reset(token)
 
     @override
     def prediction_step(

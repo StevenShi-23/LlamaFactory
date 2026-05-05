@@ -394,6 +394,21 @@ def get_train_args(args: dict[str, Any] | list[str] | None = None) -> _TRAIN_CLS
     if model_args.use_kt and is_deepspeed_zero3_enabled():
         raise ValueError("KTransformers is incompatible with DeepSpeed ZeRO-3.")
 
+    if finetuning_args.context_parallel_size > 1:
+        cp = finetuning_args.context_parallel_size
+        if finetuning_args.stage != "sft":
+            raise ValueError("`context_parallel_size > 1` is only supported for the SFT stage.")
+        ws = int(os.environ.get("WORLD_SIZE", "1"))
+        if ws % cp != 0:
+            raise ValueError(f"WORLD_SIZE ({ws}) must be divisible by context_parallel_size ({cp}).")
+        if training_args.eval_strategy != "no" or training_args.do_eval or training_args.do_predict:
+            raise ValueError(
+                "Eval/predict is not supported when `context_parallel_size > 1`. "
+                "Set `eval_strategy='no'`, `do_eval=False`, `do_predict=False`."
+            )
+        if training_args.predict_with_generate:
+            raise ValueError("`predict_with_generate` is not supported when `context_parallel_size > 1`.")
+
     _set_env_vars()
     _verify_model_args(model_args, data_args, finetuning_args)
     _check_extra_dependencies(model_args, finetuning_args, training_args)

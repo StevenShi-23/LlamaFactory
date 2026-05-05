@@ -556,6 +556,17 @@ class FinetuningArguments(
         default=False,
         metadata={"help": "Whether or not to compute effective tokens per second."},
     )
+    context_parallel_size: int = field(
+        default=1,
+        metadata={
+            "help": (
+                "Ulysses context-parallel group size. 1 disables CP. "
+                "Requires `num_attention_heads % cp_size == 0` and "
+                "(`num_key_value_heads % cp_size == 0` OR `cp_size % num_key_value_heads == 0`). "
+                "Currently supports SFT stage only; eval/generate is disabled when cp>1."
+            )
+        },
+    )
 
     def __post_init__(self):
         def split_arg(arg):

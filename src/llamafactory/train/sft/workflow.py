@@ -15,7 +15,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 from typing import TYPE_CHECKING, Optional
+
+# Gemma-4 bootstrap must run BEFORE `from ...data import ...` because that
+# import chain pulls in `mm_plugin`, which eagerly imports `torchaudio`. The
+# bootstrap installs a torchaudio stub when the real module is missing. All
+# other patches in the bootstrap are class-conditional on Gemma4Config /
+# Gemma4ForConditionalGeneration, so this is a no-op for non-Gemma-4 runs.
+# Opt out with GEMMA4_BOOTSTRAP=0.
+if os.environ.get("GEMMA4_BOOTSTRAP", "1") == "1":
+    from ...v1.gemma4_bootstrap import apply_v0 as _apply_gemma4_bootstrap_v0
+
+    _apply_gemma4_bootstrap_v0()
 
 from ...data import SFTDataCollatorWith4DAttentionMask, get_dataset, get_template_and_fix_tokenizer
 from ...extras.constants import IGNORE_INDEX
