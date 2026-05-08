@@ -399,7 +399,8 @@ def get_train_args(args: dict[str, Any] | list[str] | None = None) -> _TRAIN_CLS
         if finetuning_args.stage != "sft":
             raise ValueError("`context_parallel_size > 1` is only supported for the SFT stage.")
         ws = int(os.environ.get("WORLD_SIZE", "1"))
-        if ws % cp != 0:
+        # Skip divisibility check in single-GPU mode (precache, dry-run, etc.)
+        if ws > 1 and ws % cp != 0:
             raise ValueError(f"WORLD_SIZE ({ws}) must be divisible by context_parallel_size ({cp}).")
         if training_args.eval_strategy != "no" or training_args.do_eval or training_args.do_predict:
             raise ValueError(

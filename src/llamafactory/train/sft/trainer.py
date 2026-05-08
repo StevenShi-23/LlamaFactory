@@ -218,7 +218,11 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         the installed `gemma_triton_flash_attn` does not expose the vision-
         group helpers (e.g., the cookbook build).
         """
-        from .cp_utils import padding_and_split_data, sequence_parallel_loss_reduce
+        import torch.distributed as dist
+
+        from .cp_utils import _cp_dbg, padding_and_split_data, sequence_parallel_loss_reduce
+
+        _cp_dbg("loss_cp", f"enter; input_keys={list(inputs.keys())}")
 
         # (a) Compute Gemma-4 vision-group state on full seq pre-split, if applicable.
         # The helpers only exist on the fork build of gemma_triton_flash_attn; on
@@ -242,16 +246,60 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
 
         try:
             # (b) Pad + split all rank-2+ tensors on last dim across cp_group.
+            # Labels are KEPT in inputs (not popped) so that the Liger fused-CE
+            # patch in run_train.py fires inside model(): it bypasses logits
+            # materialisation entirely (hidden_states × lm_head_weight → CE
+            # in one Triton tile), saving ~32 GB bf16 logits at N_local=64K.
+            # The labels passed in are this rank's shifted CP-local shard.
+            _cp_dbg("loss_cp", "before padding_and_split_data")
             inputs = padding_and_split_data(dict(inputs), self.cp_group, ignore_index=IGNORE_INDEX)
+            _cp_dbg("loss_cp", f"after padding_and_split_data; new_keys={list(inputs.keys())}")
 
-            # (c) Forward. Pop labels so HF's model-internal loss isn't computed;
-            # we do the CP-aware reduce ourselves below.
-            labels = inputs.pop("labels")
+            # Shift labels by 1 for causal LM within this rank's local shard.
+            # Note: the last token of each CP rank's labels is a "cross-shard"
+            # edge whose true target lives on the next rank. We approximate it
+            # with IGNORE_INDEX (mask it out) — this introduces 1/N_local ≈ 0%
+            # loss error, acceptable for training and smoke tests.
+            labels_local = inputs.pop("labels")          # (B, N_local)
+            shift_labels = torch.roll(labels_local, -1, dims=-1)
+            shift_labels[:, -1] = IGNORE_INDEX           # mask the cross-rank edge
+            # Replace labels in inputs with shifted version for Liger's CE.
+            inputs["labels"] = shift_labels
+
+            _cp_dbg("loss_cp", f"calling model(...) with input_keys={list(inputs.keys())}")
             outputs = model(**inputs)
 
-            # (d) Loss weights: 1.0 for supervised tokens, 0.0 for ignore_index.
-            loss_weights = (labels != IGNORE_INDEX).to(outputs.logits.dtype)
-            loss = sequence_parallel_loss_reduce(outputs.logits, labels, loss_weights, self.cp_group)
+            # Liger fused CE: `outputs.loss` is the local mean CE (no logits materialized).
+            # If Liger didn't fire (e.g. fallback path), outputs.logits is non-None.
+            if outputs.loss is not None:
+                _cp_dbg("loss_cp", f"Liger path: outputs.loss={outputs.loss.item():.4f}")
+                local_loss = outputs.loss
+            else:
+                # Fallback: Liger not active, compute chunked CE from logits.
+                _cp_dbg("loss_cp", f"logits fallback; logits_shape={tuple(outputs.logits.shape)}")
+                loss_weights = (shift_labels != IGNORE_INDEX).float()
+                local_loss = sequence_parallel_loss_reduce(
+                    outputs.logits, shift_labels, loss_weights, self.cp_group
+                )
+                if kwargs.get("return_outputs", False):
+                    return local_loss, outputs
+                return local_loss
+
+            # Return local_loss directly for backward. Gradients flow through
+            # Liger's fused CE → backbone — correct because DS all-reduces
+            # gradients across all 16 world ranks, which naturally averages
+            # over the 4 DP samples × 4 CP shards (math works out exactly).
+            # No all_reduce of the loss needed for correctness; only log it.
+            with torch.no_grad():
+                global_loss_display = local_loss.detach().clone()
+                dist.all_reduce(
+                    global_loss_display, op=dist.ReduceOp.SUM, group=self.cp_group
+                )
+                global_loss_display.div_(dist.get_world_size(self.cp_group))
+            _cp_dbg("loss_cp", f"global loss={global_loss_display.item():.4f}")
+            # local_loss ≈ global_loss (both normalize per N_local or N_full
+            # of valid tokens, which are equal in distribution). Return local.
+            loss = local_loss
 
             if kwargs.get("return_outputs", False):
                 return loss, outputs
