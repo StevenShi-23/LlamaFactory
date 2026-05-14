@@ -154,22 +154,30 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
                     "need n_kv % cp == 0 OR cp % n_kv == 0 (the latter replicates KV heads)."
                 )
 
-            # Swap triton_gqa -> triton_gqa_ulysses only if triton_gqa is the
-            # currently selected implementation. Non-Gemma models keep their own path.
-            from gemma_triton_flash_attn import register_triton_attention_ulysses
+            # Swap triton_gqa -> CP variant. Use varlen_ulysses when packing is active.
+            data_collator = kwargs.get("data_collator", None)
+            use_packing = getattr(data_collator, "neat_packing", False)
+            if use_packing:
+                from gemma_triton_flash_attn import register_triton_attention_varlen_ulysses
+                register_triton_attention_varlen_ulysses(self.cp_group, name="triton_gqa_varlen_ulysses")
+                attn_name = "triton_gqa_varlen_ulysses"
+            else:
+                from gemma_triton_flash_attn import register_triton_attention_ulysses
+                register_triton_attention_ulysses(self.cp_group, name="triton_gqa_ulysses")
+                attn_name = "triton_gqa_ulysses"
 
-            register_triton_attention_ulysses(self.cp_group, name="triton_gqa_ulysses")
             if getattr(self.model.config, "_attn_implementation", None) == "triton_gqa":
-                self.model.config._attn_implementation = "triton_gqa_ulysses"
+                self.model.config._attn_implementation = attn_name
             if hasattr(self.model.config, "text_config") and self.model.config.text_config is not None:
                 if getattr(self.model.config.text_config, "_attn_implementation", None) == "triton_gqa":
-                    self.model.config.text_config._attn_implementation = "triton_gqa_ulysses"
+                    self.model.config.text_config._attn_implementation = attn_name
 
             logger.info_rank0(
                 f"Context parallelism enabled: cp_size={cp}, dp_size={ws // cp}, "
-                f"attn_implementation=triton_gqa_ulysses."
+                f"attn_implementation={attn_name}, packing={use_packing}."
             )
 
+    @override
     @override
     def create_optimizer(self) -> "torch.optim.Optimizer":
         if self.optimizer is None:
@@ -185,7 +193,54 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
 
     @override
     def _get_train_sampler(self, *args, **kwargs) -> Optional["torch.utils.data.Sampler"]:
+        # Test hook: fixed-order sampler cycles [0,1,2,...,N-1] regardless of
+        # world_size or CP. Set CP_TEST_FIXED_SAMPLER=1 to enable.
+        if os.environ.get("CP_TEST_FIXED_SAMPLER") == "1":
+            from torch.utils.data import Sampler
+
+            class _FixedOrder(Sampler):
+                def __init__(self, ds):
+                    self.n = len(ds)
+                def __iter__(self):
+                    i = 0
+                    while True:
+                        yield i % self.n
+                        i += 1
+                def __len__(self):
+                    return self.n * 1000
+
+            return _FixedOrder(self.train_dataset)
+
+        # CP-aware sampler: only dp_size ranks contribute unique samples.
+        # All CP ranks within a group get the same sample (via broadcast in
+        # _compute_loss_cp). The sampler must shard data across dp_size, not
+        # world_size, so each DP rank gets 1/dp_size of the dataset.
+        if self.cp_group is not None:
+            import torch.distributed as dist
+
+            cp_size = dist.get_world_size(self.cp_group)
+            world_size = dist.get_world_size()
+            dp_size = world_size // cp_size
+            dp_rank = dist.get_rank() // cp_size
+            do_shuffle = not self.finetuning_args.disable_shuffling
+            return torch.utils.data.DistributedSampler(
+                self.train_dataset,
+                num_replicas=dp_size,
+                rank=dp_rank,
+                shuffle=do_shuffle,
+                seed=self.args.seed,
+            )
+
         if self.finetuning_args.disable_shuffling:
+            import torch.distributed as dist
+
+            if dist.is_initialized() and dist.get_world_size() > 1:
+                return torch.utils.data.DistributedSampler(
+                    self.train_dataset,
+                    num_replicas=dist.get_world_size(),
+                    rank=dist.get_rank(),
+                    shuffle=False,
+                )
             return torch.utils.data.SequentialSampler(self.train_dataset)
 
         return super()._get_train_sampler(*args, **kwargs)
@@ -245,29 +300,72 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
             pass
 
         try:
-            # (b) Pad + split all rank-2+ tensors on last dim across cp_group.
-            # Labels are KEPT in inputs (not popped) so that the Liger fused-CE
-            # patch in run_train.py fires inside model(): it bypasses logits
-            # materialisation entirely (hidden_states × lm_head_weight → CE
-            # in one Triton tile), saving ~32 GB bf16 logits at N_local=64K.
-            # The labels passed in are this rank's shifted CP-local shard.
+            # (b) Replicate data across CP group: HF's DistributedSampler gives
+            # each rank a DIFFERENT sample, but all CP ranks must process the
+            # SAME sample (just different seq-position shards). Broadcast rank 0's
+            # inputs to all other ranks within the CP group.
+            # Real data has variable-length samples, so tensors have different shapes
+            # across ranks. First broadcast shape, then allocate matching buffers.
+            cp_src = dist.distributed_c10d.get_global_rank(self.cp_group, 0)
+            cp_local_rank = dist.get_rank(self.cp_group)
+            inputs = dict(inputs)
+            for k, v in inputs.items():
+                if isinstance(v, torch.Tensor):
+                    shape_tensor = torch.tensor(v.shape, dtype=torch.long, device=v.device)
+                    dist.broadcast(shape_tensor, src=cp_src, group=self.cp_group)
+                    if cp_local_rank != 0:
+                        v = torch.empty(shape_tensor.tolist(), dtype=v.dtype, device=v.device)
+                        inputs[k] = v
+                    dist.broadcast(v, src=cp_src, group=self.cp_group)
+
+            # Extract cu_seqlens from attention_mask before splitting (for varlen+packing)
+            varlen_token = None
+            attn_impl = getattr(self.model.config, "_attn_implementation", "")
+            is_varlen = "varlen" in (attn_impl or "")
+            pre_split_cu = None
+            if is_varlen:
+                attn_mask = inputs.get("attention_mask")
+                if attn_mask is not None and attn_mask.dim() == 2:
+                    from gemma_triton_flash_attn.hf_integration import (
+                        cu_seqlens_from_2d_indices,
+                    )
+                    pre_split_cu, _ = cu_seqlens_from_2d_indices(attn_mask)
+
             _cp_dbg("loss_cp", "before padding_and_split_data")
-            inputs = padding_and_split_data(dict(inputs), self.cp_group, ignore_index=IGNORE_INDEX)
+            inputs = padding_and_split_data(inputs, self.cp_group, ignore_index=IGNORE_INDEX)
             _cp_dbg("loss_cp", f"after padding_and_split_data; new_keys={list(inputs.keys())}")
 
-            # Shift labels by 1 for causal LM within this rank's local shard.
-            # Note: the last token of each CP rank's labels is a "cross-shard"
-            # edge whose true target lives on the next rank. We approximate it
-            # with IGNORE_INDEX (mask it out) — this introduces 1/N_local ≈ 0%
-            # loss error, acceptable for training and smoke tests.
+            # Set varlen cu_seqlens AFTER split so we know the full padded length
+            if is_varlen and pre_split_cu is not None:
+                from gemma_triton_flash_attn.hf_integration import set_varlen_cu_seqlens
+                cp_ws = dist.get_world_size(self.cp_group)
+                N_local = inputs["input_ids"].shape[-1]
+                N_full = N_local * cp_ws
+                total_valid = int(pre_split_cu[-1].item())
+                max_sl = max(int(pre_split_cu[i+1] - pre_split_cu[i]) for i in range(pre_split_cu.numel() - 1))
+                # Append dummy sample for padding region (stable shape for grad checkpoint)
+                if total_valid < N_full:
+                    cu_final = torch.cat([pre_split_cu, torch.tensor([N_full], dtype=torch.int32, device=pre_split_cu.device)])
+                    max_sl = max(max_sl, N_full - total_valid)
+                else:
+                    cu_final = pre_split_cu
+                varlen_token = set_varlen_cu_seqlens(cu_final, max_sl)
+                _cp_dbg("loss_cp", f"varlen: {pre_split_cu.numel()-1} samples, valid={total_valid}, N_full={N_full}, cu_len={cu_final.numel()}")
+
+            # Mask the cross-shard boundary: this rank's last label position's
+            # true target lives on the next CP rank's shard. Mask it with
+            # IGNORE_INDEX so Liger excludes it from CE. Error: 1/N_local ≈ 0%.
+            # Do NOT pre-shift labels — Liger shifts internally (labels[...,1:]).
             labels_local = inputs.pop("labels")          # (B, N_local)
-            shift_labels = torch.roll(labels_local, -1, dims=-1)
-            shift_labels[:, -1] = IGNORE_INDEX           # mask the cross-rank edge
-            # Replace labels in inputs with shifted version for Liger's CE.
-            inputs["labels"] = shift_labels
+            labels_local = labels_local.clone()
+            labels_local[:, -1] = IGNORE_INDEX
+            inputs["labels"] = labels_local
 
             _cp_dbg("loss_cp", f"calling model(...) with input_keys={list(inputs.keys())}")
             outputs = model(**inputs)
+
+            # NOTE: don't clear varlen_token here — backward (gradient checkpointing
+            # recompute) needs the cu_seqlens ContextVar. It gets overwritten next step.
 
             # Liger fused CE: `outputs.loss` is the local mean CE (no logits materialized).
             # If Liger didn't fire (e.g. fallback path), outputs.logits is non-None.
@@ -285,21 +383,29 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
                     return local_loss, outputs
                 return local_loss
 
-            # Return local_loss directly for backward. Gradients flow through
-            # Liger's fused CE → backbone — correct because DS all-reduces
-            # gradients across all 16 world ranks, which naturally averages
-            # over the 4 DP samples × 4 CP shards (math works out exactly).
-            # No all_reduce of the loss needed for correctness; only log it.
+            # Weighted loss: scale by (local_valid / global_valid) instead of 1/cp_size.
+            # With interleaved human/gpt data, shards have unequal valid token counts.
+            # Weight by valid-token fraction so gradients match non-CP training exactly.
+            local_valid = (labels_local != IGNORE_INDEX).sum().float()
+            global_valid = local_valid.clone()
+            dist.all_reduce(global_valid, op=dist.ReduceOp.SUM, group=self.cp_group)
+
+            weight = local_valid / (global_valid + 1e-8)
+            scaled_loss = local_loss * weight
+
             with torch.no_grad():
-                global_loss_display = local_loss.detach().clone()
-                dist.all_reduce(
-                    global_loss_display, op=dist.ReduceOp.SUM, group=self.cp_group
-                )
-                global_loss_display.div_(dist.get_world_size(self.cp_group))
-            _cp_dbg("loss_cp", f"global loss={global_loss_display.item():.4f}")
-            # local_loss ≈ global_loss (both normalize per N_local or N_full
-            # of valid tokens, which are equal in distribution). Return local.
-            loss = local_loss
+                local_loss_sum = local_loss.detach() * local_valid
+                global_loss_sum = local_loss_sum.clone()
+                dist.all_reduce(global_loss_sum, op=dist.ReduceOp.SUM, group=self.cp_group)
+                global_ce = global_loss_sum / (global_valid + 1e-8)
+
+            if dist.get_rank() == 0:
+                print(f"[CP] global_ce={global_ce.item():.4f} local={local_loss.item():.4f} "
+                      f"valid={int(local_valid.item())}/{int(global_valid.item())} "
+                      f"weight={weight.item():.4f}", flush=True)
+            loss = scaled_loss
+            _cp_dbg("loss_cp", f"local={local_loss.item():.4f} scaled={scaled_loss.item():.4f} "
+                     f"global_ce={global_ce.item():.4f} weight={weight.item():.4f}")
 
             if kwargs.get("return_outputs", False):
                 return loss, outputs

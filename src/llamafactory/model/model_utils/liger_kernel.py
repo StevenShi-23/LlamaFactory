@@ -45,6 +45,61 @@ def apply_liger_kernel(
         from liger_kernel.transformers import apply_liger_kernel_to_gemma3 as apply_liger_kernel
     elif model_type == "gemma3_text":
         from liger_kernel.transformers import apply_liger_kernel_to_gemma3_text as apply_liger_kernel
+    elif model_type in ("gemma4", "gemma4_text"):
+        # Class-level patches to modeling_gemma4.Gemma4RMSNorm and
+        # modeling_gemma4.Gemma4TextMLP, so the inner Gemma4TextModel picks up
+        # Liger's fused kernels on construction.
+        #
+        # We skip Liger's fused_linear_cross_entropy (patches Gemma4ForCausalLM,
+        # but our architecture is Gemma4ForConditionalGeneration — the outer
+        # wrapper handles loss itself, and run_train.py binds LigerForCausalLMLoss
+        # onto the wrapper directly).
+        #
+        # For GEGLU, we do NOT use Liger's default LigerGEGLUMLPForGemma4: at
+        # seq=256K the gate_proj/up_proj/intermediate tensors each weigh 10.5 GB
+        # bf16 and all three live concurrently inside the fused kernel's
+        # `torch.empty_like(a)` path (OOM at 130 GB/rank). Instead swap in
+        # LigerTiledGEGLUMLPForGemma4 which shards the sequence and recomputes
+        # MLP forward in backward — cuts MLP peak from ~30 GB to ~500 MB per
+        # shard, at the cost of one extra MLP forward pass per layer per step.
+        def apply_liger_kernel(**_outer_kwargs):
+            from liger_kernel.transformers import apply_liger_kernel_to_gemma4_text
+
+            apply_liger_kernel_to_gemma4_text(
+                fused_linear_cross_entropy=False,
+                cross_entropy=False,
+                rms_norm=True,
+                geglu=False,
+            )
+
+            from transformers.models.gemma4 import modeling_gemma4
+            from liger_kernel.transformers.tiled_mlp import LigerTiledGEGLUMLP
+
+            class LigerTiledGEGLUMLPForGemma4(LigerTiledGEGLUMLP):
+                """Tiled GEGLU MLP matching Gemma4TextMLP's (config, layer_idx) ctor.
+
+                Handles the use_double_wide_mlp + KV-shared-layer branch defensively
+                (Gemma4-31B disables both, but keep it correct for future variants)."""
+
+                def __init__(self, config, layer_idx=None):
+                    super().__init__(config)
+                    num_shared = getattr(config, "num_kv_shared_layers", 0)
+                    use_double = getattr(config, "use_double_wide_mlp", False)
+                    if layer_idx is not None and use_double and num_shared > 0:
+                        import torch.nn as nn
+
+                        first_shared = config.num_hidden_layers - num_shared
+                        if layer_idx >= first_shared:
+                            doubled = config.intermediate_size * 2
+                            self.intermediate_size = doubled
+                            self.gate_proj = nn.Linear(self.hidden_size, doubled, bias=False)
+                            self.up_proj = nn.Linear(self.hidden_size, doubled, bias=False)
+                            self.down_proj = nn.Linear(doubled, self.hidden_size, bias=False)
+
+            modeling_gemma4.Gemma4TextMLP = LigerTiledGEGLUMLPForGemma4
+            logger.info_rank0(
+                "Patched Gemma4TextMLP → LigerTiledGEGLUMLPForGemma4 (tiled MLP with recompute)."
+            )
     elif model_type in ["glm", "glm4"]: # for glm4-9b, glm4-32B respectively
         from liger_kernel.transformers import apply_liger_kernel_to_glm4 as apply_liger_kernel
     elif model_type == "glm4v":
