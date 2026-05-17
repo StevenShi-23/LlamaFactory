@@ -191,6 +191,25 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         create_custom_scheduler(self.args, num_training_steps, optimizer)
         return super().create_scheduler(num_training_steps, optimizer)
 
+    def get_train_dataloader(self):
+        if self.cp_group is None:
+            return super().get_train_dataloader()
+
+        import torch.distributed as dist
+        from torch.utils.data import DataLoader
+
+        sampler = self._get_train_sampler()
+        dl = DataLoader(
+            self.train_dataset,
+            batch_size=self.args.per_device_train_batch_size,
+            sampler=sampler,
+            collate_fn=self.data_collator,
+            num_workers=self.args.dataloader_num_workers,
+            pin_memory=self.args.dataloader_pin_memory,
+            drop_last=self.args.dataloader_drop_last,
+        )
+        return dl
+
     @override
     def _get_train_sampler(self, *args, **kwargs) -> Optional["torch.utils.data.Sampler"]:
         # Test hook: fixed-order sampler cycles [0,1,2,...,N-1] regardless of
