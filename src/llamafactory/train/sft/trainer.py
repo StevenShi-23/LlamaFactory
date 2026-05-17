@@ -350,6 +350,12 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
                     )
                     pre_split_cu, _ = cu_seqlens_from_2d_indices(attn_mask)
 
+            if "position_ids" not in inputs:
+                seq_len = inputs["input_ids"].shape[-1]
+                inputs["position_ids"] = torch.arange(
+                    seq_len, device=inputs["input_ids"].device
+                ).unsqueeze(0).expand(inputs["input_ids"].shape[0], -1)
+
             _cp_dbg("loss_cp", "before padding_and_split_data")
             inputs = padding_and_split_data(inputs, self.cp_group, ignore_index=IGNORE_INDEX)
             _cp_dbg("loss_cp", f"after padding_and_split_data; new_keys={list(inputs.keys())}")
