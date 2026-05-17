@@ -428,7 +428,7 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
                 print(f"[CP] global_ce={global_ce.item():.4f} local={local_loss.item():.4f} "
                       f"valid={int(local_valid.item())}/{int(global_valid.item())} "
                       f"weight={weight.item():.4f}", flush=True)
-            loss = scaled_loss
+            loss = scaled_loss - scaled_loss.detach() + global_ce.detach()
             _cp_dbg("loss_cp", f"local={local_loss.item():.4f} scaled={scaled_loss.item():.4f} "
                      f"global_ce={global_ce.item():.4f} weight={weight.item():.4f}")
 
