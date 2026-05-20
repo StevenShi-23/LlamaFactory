@@ -128,8 +128,9 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
             verify_fp8_status(self.accelerator, training_args)
 
         # Ulysses context parallelism (Gemma-4 long-context path).
-        # See /fsx/home/zijishi/.claude/plans/hashed-swinging-finch.md.
         self.cp_group = None
+        self._cp_ce_sum_accum = 0.0
+        self._cp_valid_accum = 0
         self.cp_mesh = None
         if finetuning_args.context_parallel_size > 1:
             import torch.distributed as dist
@@ -176,6 +177,14 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
                 f"Context parallelism enabled: cp_size={cp}, dp_size={ws // cp}, "
                 f"attn_implementation={attn_name}, packing={use_packing}."
             )
+
+    @override
+    def log(self, logs: dict[str, float], start_time: float | None = None) -> None:
+        if self._cp_valid_accum > 0:
+            logs["global_ce"] = round(self._cp_ce_sum_accum / self._cp_valid_accum, 4)
+            self._cp_ce_sum_accum = 0.0
+            self._cp_valid_accum = 0
+        super().log(logs, start_time)
 
     @override
     @override
@@ -413,18 +422,25 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
 
             # Weighted loss: each CP rank contributes its fraction of the
             # sample's mean CE. sum_cp(scaled_loss) = global_ce.
-            local_valid = (shift_labels_local != IGNORE_INDEX).sum().float()
-            global_valid = local_valid.clone()
+            # NaN-safe: if a shard has zero valid tokens, its contribution is 0.
+            local_valid = (shift_labels_local != IGNORE_INDEX).sum()
+            global_valid = local_valid.clone().float()
             dist.all_reduce(global_valid, op=dist.ReduceOp.SUM, group=self.cp_group)
 
-            weight = local_valid / (global_valid + 1e-8)
-            scaled_loss = local_loss * weight
+            has_valid = local_valid > 0
+            safe_loss = torch.where(has_valid, local_loss, torch.zeros_like(local_loss))
+            local_ce_sum = safe_loss * local_valid.float()
+            weight = local_valid.float() / (global_valid + 1e-8)
+            scaled_loss = safe_loss * weight
 
             with torch.no_grad():
-                local_loss_sum = local_loss.detach() * local_valid
-                global_loss_sum = local_loss_sum.clone()
-                dist.all_reduce(global_loss_sum, op=dist.ReduceOp.SUM, group=self.cp_group)
-                global_ce = global_loss_sum / (global_valid + 1e-8)
+                global_ce_sum = local_ce_sum.detach().clone()
+                dist.all_reduce(global_ce_sum, op=dist.ReduceOp.SUM, group=self.cp_group)
+                global_ce = global_ce_sum / (global_valid + 1e-8)
+
+            # Accumulate CE sum and valid count for per-token logging.
+            self._cp_ce_sum_accum += global_ce_sum.item()
+            self._cp_valid_accum += int(global_valid.item())
 
             # Identity trick: gradient flows through scaled_loss, but
             # .item() reports global_ce for wandb/logging.
