@@ -356,8 +356,20 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
                     seq_len, device=inputs["input_ids"].device
                 ).unsqueeze(0).expand(inputs["input_ids"].shape[0], -1)
 
+            # Pre-shift labels globally BEFORE splitting, so each CP rank's
+            # shard has the correct next-token targets with no boundary gap.
+            # Both HF's ForCausalLMLoss and Liger's LigerForCausalLMLoss skip
+            # internal shifting when shift_labels is provided.
+            labels_full = inputs.pop("labels")           # (B, N_full)
+            shift_labels_full = torch.cat([
+                labels_full[:, 1:],
+                torch.full((labels_full.shape[0], 1), IGNORE_INDEX,
+                           dtype=labels_full.dtype, device=labels_full.device),
+            ], dim=-1)                                   # (B, N_full)
+            inputs["shift_labels"] = shift_labels_full
+
             _cp_dbg("loss_cp", "before padding_and_split_data")
-            inputs = padding_and_split_data(inputs, self.cp_group, ignore_index=IGNORE_INDEX)
+            inputs = padding_and_split_data(inputs, self.cp_group, label_key="shift_labels", ignore_index=IGNORE_INDEX)
             _cp_dbg("loss_cp", f"after padding_and_split_data; new_keys={list(inputs.keys())}")
 
             # Set varlen cu_seqlens AFTER split so we know the full padded length
@@ -377,14 +389,7 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
                 varlen_token = set_varlen_cu_seqlens(cu_final, max_sl)
                 _cp_dbg("loss_cp", f"varlen: {pre_split_cu.numel()-1} samples, valid={total_valid}, N_full={N_full}, cu_len={cu_final.numel()}")
 
-            # Mask the cross-shard boundary: this rank's last label position's
-            # true target lives on the next CP rank's shard. Mask it with
-            # IGNORE_INDEX so Liger excludes it from CE. Error: 1/N_local ≈ 0%.
-            # Do NOT pre-shift labels — Liger shifts internally (labels[...,1:]).
-            labels_local = inputs.pop("labels")          # (B, N_local)
-            labels_local = labels_local.clone()
-            labels_local[:, -1] = IGNORE_INDEX
-            inputs["labels"] = labels_local
+            shift_labels_local = inputs["shift_labels"]   # (B, N_local)
 
             _cp_dbg("loss_cp", f"calling model(...) with input_keys={list(inputs.keys())}")
             outputs = model(**inputs)
@@ -395,23 +400,20 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
             # Liger fused CE: `outputs.loss` is the local mean CE (no logits materialized).
             # If Liger didn't fire (e.g. fallback path), outputs.logits is non-None.
             if outputs.loss is not None:
-                _cp_dbg("loss_cp", f"Liger path: outputs.loss={outputs.loss.item():.4f}")
                 local_loss = outputs.loss
             else:
                 # Fallback: Liger not active, compute chunked CE from logits.
-                _cp_dbg("loss_cp", f"logits fallback; logits_shape={tuple(outputs.logits.shape)}")
-                loss_weights = (shift_labels != IGNORE_INDEX).float()
+                loss_weights = (shift_labels_local != IGNORE_INDEX).float()
                 local_loss = sequence_parallel_loss_reduce(
-                    outputs.logits, shift_labels, loss_weights, self.cp_group
+                    outputs.logits, shift_labels_local, loss_weights, self.cp_group
                 )
                 if kwargs.get("return_outputs", False):
                     return local_loss, outputs
                 return local_loss
 
-            # Weighted loss: scale by (local_valid / global_valid) instead of 1/cp_size.
-            # With interleaved human/gpt data, shards have unequal valid token counts.
-            # Weight by valid-token fraction so gradients match non-CP training exactly.
-            local_valid = (labels_local != IGNORE_INDEX).sum().float()
+            # Weighted loss: each CP rank contributes its fraction of the
+            # sample's mean CE. sum_cp(scaled_loss) = global_ce.
+            local_valid = (shift_labels_local != IGNORE_INDEX).sum().float()
             global_valid = local_valid.clone()
             dist.all_reduce(global_valid, op=dist.ReduceOp.SUM, group=self.cp_group)
 
@@ -424,13 +426,9 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
                 dist.all_reduce(global_loss_sum, op=dist.ReduceOp.SUM, group=self.cp_group)
                 global_ce = global_loss_sum / (global_valid + 1e-8)
 
-            if dist.get_rank() == 0:
-                print(f"[CP] global_ce={global_ce.item():.4f} local={local_loss.item():.4f} "
-                      f"valid={int(local_valid.item())}/{int(global_valid.item())} "
-                      f"weight={weight.item():.4f}", flush=True)
+            # Identity trick: gradient flows through scaled_loss, but
+            # .item() reports global_ce for wandb/logging.
             loss = scaled_loss - scaled_loss.detach() + global_ce.detach()
-            _cp_dbg("loss_cp", f"local={local_loss.item():.4f} scaled={scaled_loss.item():.4f} "
-                     f"global_ce={global_ce.item():.4f} weight={weight.item():.4f}")
 
             if kwargs.get("return_outputs", False):
                 return loss, outputs
