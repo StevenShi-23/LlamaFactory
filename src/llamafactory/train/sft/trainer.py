@@ -420,9 +420,20 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
                     return local_loss, outputs
                 return local_loss
 
-            # Weighted loss: each CP rank contributes its fraction of the
-            # sample's mean CE. sum_cp(scaled_loss) = global_ce.
-            # NaN-safe: if a shard has zero valid tokens, its contribution is 0.
+            # ── CP loss reduction ─────────────────────────────────────
+            # Each CP rank holds a shard of one sample's sequence.
+            # scaled_loss = local_mean_CE × (local_valid / global_valid)
+            # gives each rank its fraction; sum across CP = global_ce.
+            #
+            # × cp_size corrects for DS ZeRO-3 averaging gradients over
+            # world_size (= dp × cp) instead of dp_size. Without it the
+            # gradient is 1/cp_size too small. Proof:
+            #   DS gives: (1/(dp×cp)) × Σ_j [cp × d(mean_CE_j)/dθ]
+            #           = (1/dp) × Σ_j d(mean_CE_j)/dθ   ← correct
+            #
+            # NaN-safe: if a shard has zero valid tokens, its contribution
+            # is zeroed out to prevent Liger's 0/0 NaN from propagating.
+            cp_size = dist.get_world_size(self.cp_group)
             local_valid = (shift_labels_local != IGNORE_INDEX).sum()
             global_valid = local_valid.clone().float()
             dist.all_reduce(global_valid, op=dist.ReduceOp.SUM, group=self.cp_group)
@@ -431,7 +442,7 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
             safe_loss = torch.where(has_valid, local_loss, torch.zeros_like(local_loss))
             local_ce_sum = safe_loss * local_valid.float()
             weight = local_valid.float() / (global_valid + 1e-8)
-            scaled_loss = safe_loss * weight
+            scaled_loss = safe_loss * weight * cp_size
 
             with torch.no_grad():
                 global_ce_sum = local_ce_sum.detach().clone()
