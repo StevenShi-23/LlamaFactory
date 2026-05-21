@@ -288,6 +288,17 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
             outputs = model(**inputs)
             return self.compute_loss_func(outputs, inputs["labels"], ref_logits)
         else:
+            # CP-off path: force per-sample uniform reduction to match
+            # _compute_loss_cp's target. By dropping `num_items_in_batch`,
+            # ForCausalLMLoss falls back to reduction="mean" (per-rank token
+            # mean), and the HF post-multiplier `loss *= num_processes` (at
+            # transformers/trainer.py L2013-L2018) is skipped because it's
+            # gated on `num_items_in_batch is not None`. After DS averages
+            # gradients by 1/(dp*ga), the effective gradient is
+            #   (1/N) * Σ_i ∂(sample_token_mean_i)/∂θ,  N = dp*ga
+            # i.e. per-sample uniform across the global batch — matching
+            # the CP>1 codepath (target (2) in the design doc).
+            kwargs["num_items_in_batch"] = None
             return super().compute_loss(model, inputs, *args, **kwargs)
 
     def _compute_loss_cp(self, model, inputs, *args, **kwargs):
