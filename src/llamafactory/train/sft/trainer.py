@@ -395,12 +395,17 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         spec = self._dist_sharding_spec()
         use_dummy = self._needs_dummy_pad(spec)
 
-        # Non-CP without a remainder keeps HF's standard (accelerate-prepared)
-        # dataloader untouched. Everything else builds a raw DataLoader: all CP>1
-        # (existing behavior) and the remainder case, where the sampler must be able
-        # to emit the all-ignore dummy index (method 1) instead of letting torch's
-        # DistributedSampler / accelerate duplicate a real pack from the front.
-        if self.cp_group is None and not use_dummy:
+        # The native (accelerate-prepared) dataloader is used ONLY when no manual
+        # DistributedSampler will be injected (spec is None): HF's default
+        # RandomSampler / SequentialSampler, which accelerate shards exactly once.
+        # Any manually-sharded case -- CP>1 OR disable_shuffling across a distributed
+        # world -- must use the raw DataLoader below, because _get_train_sampler
+        # injects an explicit DistributedSampler and routing that through
+        # accelerator.prepare would let BatchSamplerShard re-shard it a second time
+        # (double sharding -> each rank sees only len(dataset)/world^2 samples). The
+        # raw path also lets the sampler emit the all-ignore dummy index (method 1)
+        # for the remainder case instead of duplicating a real pack from the front.
+        if spec is None and not use_dummy:
             return super().get_train_dataloader()
 
         from torch.utils.data import DataLoader
