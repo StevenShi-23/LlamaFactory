@@ -24,6 +24,8 @@ from typing import TYPE_CHECKING, Any, Optional, Union
 
 import numpy as np
 import torch
+from accelerate.data_loader import DataLoaderStateMixin
+from accelerate.state import GradientState
 from transformers import Seq2SeqTrainer
 from typing_extensions import override
 
@@ -140,6 +142,76 @@ class _DummyPadDistributedSampler(torch.utils.data.Sampler):
         indices = indices[self.rank : self.total_size : self.num_replicas]
         assert len(indices) == self.num_samples
         return iter(indices)
+
+
+class _EpochAwareDataLoader(torch.utils.data.DataLoader, DataLoaderStateMixin):
+    """Raw ``DataLoader`` that restores the two ``accelerator.prepare``-d behaviours
+    the manually-sharded path loses by bypassing ``accelerate`` (see
+    ``get_train_dataloader``). It is a drop-in for ``torch DataLoader`` and changes
+    nothing about batching, sampling order, or the forwarded
+    ``num_workers``/``pin_memory``/``drop_last`` options.
+
+    1. **Per-epoch reshuffle.** ``set_epoch(epoch)`` forwards to the sampler's
+       ``set_epoch``, so HF's per-epoch ``train_dataloader.set_epoch(epoch)`` call
+       (``transformers/trainer.py``: ``if hasattr(train_dataloader, "set_epoch"):
+       train_dataloader.set_epoch(epoch)``) drives reshuffling exactly like the
+       native accelerate loader. It is a no-op when the sampler has no
+       ``set_epoch`` or when shuffling is disabled (``DistributedSampler`` /
+       ``_DummyPadDistributedSampler`` ignore the epoch when ``shuffle=False``), so
+       the ``disable_shuffling`` order stays deterministic across epochs.
+
+    2. **Last-step detection.** ``accelerator.gradient_state.end_of_dataloader``
+       flips to ``True`` on the final batch. ``GradientState`` is a process-wide
+       singleton, so the instance created here shares state with
+       ``self.accelerator.gradient_state``; registering via accelerate's
+       ``DataLoaderStateMixin`` (``begin``/``end``) plus a one-batch look-ahead to
+       flag the last batch reproduces ``accelerate.data_loader.DataLoaderShard``
+       precisely, so ``self.accelerator.gradient_state.end_of_dataloader`` (read at
+       ``transformers/trainer.py``'s ``is_last_step = ...end_of_dataloader``) works
+       for the raw loader too.
+
+    Gradient-accumulation sync is intentionally untouched: HF sets
+    ``gradient_state._set_sync_gradients(...)`` itself and does not depend on
+    accelerate's prepared dataloader for that.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # Borg singleton -> the SAME shared state as self.accelerator.gradient_state,
+        # which is what makes registering here flip the trainer-visible flag.
+        self.gradient_state = GradientState()
+        self._drop_last = self.drop_last  # used by DataLoaderStateMixin.begin()
+
+    def set_epoch(self, epoch: int) -> None:
+        if hasattr(self.sampler, "set_epoch"):
+            self.sampler.set_epoch(epoch)
+
+    def __iter__(self):
+        # begin(): end_of_dataloader=False + gradient_state._add_dataloader(self)
+        # (sets in_dataloader=True with self as the active dataloader). Mirrors
+        # accelerate.data_loader.DataLoaderShard.__iter__.
+        self.begin()
+        try:
+            base_iter = super().__iter__()
+            try:
+                current = next(base_iter)
+            except StopIteration:
+                return
+            # One-batch look-ahead so end_of_dataloader is True *before* the last
+            # batch is yielded, exactly as the native (prepared) loader does.
+            while True:
+                try:
+                    next_batch = next(base_iter)
+                except StopIteration:
+                    self.end_of_dataloader = True
+                    yield current
+                    break
+                else:
+                    yield current
+                    current = next_batch
+        finally:
+            # end(): gradient_state._remove_dataloader(self) -> in_dataloader False.
+            self.end()
 
 
 class CustomSeq2SeqTrainer(Seq2SeqTrainer):
@@ -408,8 +480,6 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         if spec is None and not use_dummy:
             return super().get_train_dataloader()
 
-        from torch.utils.data import DataLoader
-
         dataset = self.train_dataset
         if use_dummy:
             pad_id = getattr(self.processing_class, "pad_token_id", None)
@@ -421,7 +491,12 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
             )
 
         sampler = self._get_train_sampler(dataset)
-        return DataLoader(
+        # _EpochAwareDataLoader (not a plain DataLoader) so the manually-sharded path
+        # mirrors the native accelerate loader's set_epoch (per-epoch reshuffle) and
+        # gradient_state.end_of_dataloader (last-step) behaviour. The forwarded
+        # num_workers / pin_memory / drop_last come straight from self.args, matching
+        # what super().get_train_dataloader() would pass to accelerator.prepare.
+        return _EpochAwareDataLoader(
             dataset,
             batch_size=self.args.per_device_train_batch_size,
             sampler=sampler,
