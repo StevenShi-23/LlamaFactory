@@ -567,6 +567,18 @@ class FinetuningArguments(
             )
         },
     )
+    loss_reduction: Literal["per_token", "per_sample"] = field(
+        default="per_token",
+        metadata={
+            "help": (
+                "How the SFT cross-entropy is normalized across the global batch, made "
+                "invariant to gradient-accumulation, data-parallel, and packing layout via "
+                "precise token/sample counting (HF `num_items_in_batch`). "
+                "`per_token`: every valid token contributes equally (longer sequences weigh more). "
+                "`per_sample`: every sample contributes equally regardless of its length."
+            )
+        },
+    )
 
     def __post_init__(self):
         def split_arg(arg):
