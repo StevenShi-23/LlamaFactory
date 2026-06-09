@@ -283,6 +283,57 @@ def get_ray_args(args: dict[str, Any] | list[str] | None = None) -> RayArguments
     return ray_args
 
 
+def derive_pack_counted_grad_accum(
+    global_batch_size_in_packs: int,
+    world_size: int,
+    context_parallel_size: int,
+    per_device_train_batch_size: int,
+    stage: str = "sft",
+    packing: bool = True,
+) -> int:
+    """Validate the pack-counted ``global_batch_size_in_packs`` (in PACKS) and derive ``gradient_accumulation_steps``.
+
+    One optimizer step consumes exactly ``global_batch_size_in_packs`` packs:
+    ``gas = global_batch_size_in_packs // (dp_size * micro)`` with
+    ``dp_size = world_size // context_parallel_size`` (cp=1 -> world_size) and ``micro == 1``.
+
+    Requires packing (``packing=True``): the global batch is counted in PACKS, so without packing
+    there are no packs to count and the configuration is rejected.
+
+    Standalone/pure (no arg objects) so it is unit-testable without full argument parsing.
+    Raises ``ValueError`` on an invalid configuration.
+    """
+    gbs = int(global_batch_size_in_packs)
+    if stage != "sft":
+        raise ValueError("`global_batch_size_in_packs` (pack-counted sampler) is only supported for the SFT stage.")
+    if not packing:
+        raise ValueError(
+            "`global_batch_size_in_packs` counts the global batch in PACKS; without packing each row "
+            "is a single sample and there are no packs. Enable `packing: true` (and `neat_packing: true`), "
+            "or use `gradient_accumulation_steps` for a sample-counted batch."
+        )
+    if gbs <= 0:
+        raise ValueError(f"`global_batch_size_in_packs` must be a positive number of packs, got {gbs}.")
+    micro = int(per_device_train_batch_size)
+    if micro != 1:
+        raise ValueError(
+            "`global_batch_size_in_packs` (pack-counted sampler) requires `per_device_train_batch_size == 1` "
+            f"(one pack per micro-batch), got {micro}."
+        )
+    cp = int(context_parallel_size)
+    ws = int(world_size)
+    if ws > 1 and ws % cp != 0:
+        raise ValueError(f"WORLD_SIZE ({ws}) must be divisible by context_parallel_size ({cp}).")
+    dp_size = max(1, ws // cp)
+    if gbs % (dp_size * micro) != 0:
+        raise ValueError(
+            f"`global_batch_size_in_packs` ({gbs}) must be divisible by dp_size * per_device_train_batch_size "
+            f"({dp_size} * {micro} = {dp_size * micro}). "
+            f"dp_size = world_size // context_parallel_size = {ws} // {cp} = {dp_size}."
+        )
+    return gbs // (dp_size * micro)
+
+
 def get_train_args(args: dict[str, Any] | list[str] | None = None) -> _TRAIN_CLS:
     if is_env_enabled("USE_MCA"):
         model_args, data_args, training_args, finetuning_args, generating_args = _parse_train_mca_args(args)
@@ -409,6 +460,42 @@ def get_train_args(args: dict[str, Any] | list[str] | None = None) -> _TRAIN_CLS
             )
         if training_args.predict_with_generate:
             raise ValueError("`predict_with_generate` is not supported when `context_parallel_size > 1`.")
+
+    if finetuning_args.global_batch_size_in_packs is not None:
+        # Pack-counted global batch (in packs). Derive gradient_accumulation_steps HERE, at parse
+        # time, because HF/accelerate consume it when the Trainer/Accelerator is built -- before the
+        # CP device mesh (which exposes dp_size at runtime) exists. dp_size is deterministically
+        # `world_size // context_parallel_size` (== cp_mesh["dp"].size(); cp=1 -> world_size), read
+        # from WORLD_SIZE which torchrun already sets for the real run (and is a harmless no-op in
+        # single-GPU precache/dry-run where ws==1).
+        #
+        # Requires packing: the batch is counted in PACKS, so packing must be on (one row == one
+        # pack). `data_args.packing` is bool|None (None == off); derive_pack_counted_grad_accum
+        # hard-errors when it is falsy.
+        ws = int(os.environ.get("WORLD_SIZE", "1"))
+        derived_gas = derive_pack_counted_grad_accum(
+            global_batch_size_in_packs=finetuning_args.global_batch_size_in_packs,
+            world_size=ws,
+            context_parallel_size=finetuning_args.context_parallel_size,
+            per_device_train_batch_size=training_args.per_device_train_batch_size,
+            stage=finetuning_args.stage,
+            packing=bool(data_args.packing),
+        )
+        if not data_args.neat_packing:
+            logger.warning_rank0(
+                "`global_batch_size_in_packs` is set with `packing` enabled but `neat_packing` is off; "
+                "`neat_packing: true` is recommended so packed samples keep correct (block-diagonal) "
+                "attention boundaries."
+            )
+        if training_args.gradient_accumulation_steps != derived_gas:
+            logger.info_rank0(
+                f"`global_batch_size_in_packs`={finetuning_args.global_batch_size_in_packs} packs -> setting "
+                f"gradient_accumulation_steps={derived_gas} (was "
+                f"{training_args.gradient_accumulation_steps}); world_size={ws}, "
+                f"context_parallel_size={finetuning_args.context_parallel_size}, "
+                f"per_device_train_batch_size={training_args.per_device_train_batch_size}."
+            )
+        training_args.gradient_accumulation_steps = derived_gas
 
     _set_env_vars()
     _verify_model_args(model_args, data_args, finetuning_args)

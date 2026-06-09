@@ -102,15 +102,25 @@ class _DummyPadDistributedSampler(torch.utils.data.Sampler):
     """``DistributedSampler`` whose padding indices are an all-ignore dummy (method 1).
 
     Mirrors ``torch.utils.data.DistributedSampler`` (drop_last=False) — each replica
-    gets exactly ``ceil(num_real / num_replicas)`` indices so every replica runs the
+    gets exactly ``total_size / num_replicas`` indices so every replica runs the
     same number of steps (collective symmetry preserved) — but the indices needed to
-    reach a multiple of ``num_replicas`` are the dataset's ``dummy_index`` rather than
+    reach the padded length are the dataset's ``dummy_index`` rather than
     wrapped-around real indices. This removes the small bias of double-counting the
     head pack(s), especially with ``disable_shuffling``.
+
+    ``pad_to_multiple`` controls how far ``num_real`` is rounded up:
+      * ``None`` (default) -> ``num_replicas``: pad just to dp-divisibility (the original
+        behavior; backward-compatible for the general dummy-pad path and the pack-counted
+        "dp" mode).
+      * ``global_batch_size_in_packs`` (N): pad the trailing partial global batch up to a full N
+        packs (pack-counted "global" mode, Megatron-style uniform N).
+    ``pad_to_multiple`` must be a multiple of ``num_replicas`` so ``total_size`` stays
+    divisible by ``num_replicas`` (holds for both: N is a multiple of dp, and
+    ``ceil(P/N)*N`` is divisible by dp).
     """
 
     def __init__(self, num_real: int, num_replicas: int, rank: int, dummy_index: int,
-                 shuffle: bool = False, seed: int = 0):
+                 shuffle: bool = False, seed: int = 0, pad_to_multiple: Optional[int] = None):
         self.num_real = int(num_real)
         self.num_replicas = int(num_replicas)
         self.rank = int(rank)
@@ -118,8 +128,10 @@ class _DummyPadDistributedSampler(torch.utils.data.Sampler):
         self.shuffle = bool(shuffle)
         self.seed = int(seed)
         self.epoch = 0
-        self.num_samples = math.ceil(self.num_real / self.num_replicas)
-        self.total_size = self.num_samples * self.num_replicas
+        self.pad_to_multiple = int(pad_to_multiple) if pad_to_multiple is not None else self.num_replicas
+        # Round num_real UP to a multiple of pad_to_multiple, then shard across replicas.
+        self.total_size = math.ceil(self.num_real / self.pad_to_multiple) * self.pad_to_multiple
+        self.num_samples = self.total_size // self.num_replicas
 
     def set_epoch(self, epoch: int) -> None:
         self.epoch = int(epoch)
@@ -436,6 +448,9 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
 
         - CP>1 : shard across ``dp_size`` (CP peers share a DP rank and get the same
           sample via the broadcast in ``_compute_loss_cp``), shuffle iff not disabled.
+        - pack-counted ``global_batch_size_in_packs`` at cp=1 + distributed : shard across the
+          full world so the trailing partial global batch is padded with the all-ignore
+          dummy (method 1) rather than accelerate WRAPPING (duplicating) real packs.
         - ``disable_shuffling`` + distributed : shard across the full world, no shuffle.
         """
         import torch.distributed as dist
@@ -445,6 +460,17 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
             world_size = dist.get_world_size()
             return (world_size // cp_size, dist.get_rank() // cp_size, not self.finetuning_args.disable_shuffling)
 
+        if self.finetuning_args.global_batch_size_in_packs is not None:
+            # Pack-counted feature (cp_group is None here): force the manual raw-loader
+            # path across the full world so the last partial global batch keeps its real
+            # packs + the all-ignore dummy (trains every pack exactly once). The native
+            # accelerate path would instead WRAP-pad the final batch with duplicated real
+            # packs (training some twice). Single-process world==1 stays None (native, no
+            # padding/duplication: HF runs ceil(P/N) steps, last step rem packs, no dummies).
+            if dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
+                return (dist.get_world_size(), dist.get_rank(), not self.finetuning_args.disable_shuffling)
+            return None
+
         if self.finetuning_args.disable_shuffling:
             if dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
                 return (dist.get_world_size(), dist.get_rank(), False)
@@ -453,30 +479,112 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         return None  # HF default (RandomSampler + accelerate sharding)
 
     def _needs_dummy_pad(self, spec: Optional[tuple[int, int, bool]]) -> bool:
-        """A dummy pad pack is needed only when the dataset size is not divisible by
-        the number of replicas (otherwise ``DistributedSampler`` adds no padding).
+        """A dummy pad pack is needed only when the dataset size is not divisible by the
+        relevant pad multiple (otherwise ``DistributedSampler`` adds no padding).
         Gated by ``LF_DUMMY_PAD`` (default on); a no-op contribution so safe generally.
+
+        The pad multiple is ``num_replicas`` (``spec[0]``) for the general dummy-pad path and
+        the pack-counted "dp" mode; it is ``global_batch_size_in_packs`` (N) for the pack-counted
+        "global" mode, where the trailing partial batch is padded up to a full N packs -- so
+        dummies are required whenever ``ceil(P / N) * N != P`` (i.e. ``P % N != 0``), even when
+        ``P % dp == 0``. Either way every real pack trains exactly once per epoch.
         """
         if os.environ.get("LF_DUMMY_PAD", "1") != "1":
             return False
         if spec is None or spec[0] <= 1 or self.train_dataset is None:
             return False
-        return len(self.train_dataset) % spec[0] != 0
+        pad_multiple = self._pack_pad_multiple(spec[0])
+        return len(self.train_dataset) % pad_multiple != 0
+
+    def _pack_pad_multiple(self, num_replicas: int) -> int:
+        """Dummy-pad multiple: ``global_batch_size_in_packs`` (N) for the pack-counted "global" mode, else ``num_replicas``."""
+        # Returning ``num_replicas`` for every non-"global" case keeps the general dummy-pad
+        # path and the pack-counted "dp" mode byte-identical to before.
+        if (
+            self.finetuning_args.global_batch_size_in_packs is not None
+            and getattr(self.finetuning_args, "pack_last_batch_pad", "dp") == "global"
+        ):
+            return self.finetuning_args.global_batch_size_in_packs
+        return num_replicas
+
+    def _effective_dp_size(self) -> int:
+        """Data-parallel degree at runtime: ``world_size // cp_size`` (cp=1 -> world_size).
+
+        Equivalent to ``cp_mesh["dp"].size()``. HF's own ``get_cp_size()`` reads accelerate's
+        parallelism_config, which the manual CP mesh never sets, so we compute dp_size here for
+        pack-counted reporting.
+        """
+        import torch.distributed as dist
+
+        if not (dist.is_available() and dist.is_initialized()):
+            return 1
+        ws = dist.get_world_size()
+        if self.cp_group is not None:
+            return ws // dist.get_world_size(self.cp_group)
+        return ws
+
+    def _validate_and_log_pack_counted(self) -> None:
+        """Validate the pack-counted global batch against the dataset and log the effective layout once.
+
+        ``global_batch_size_in_packs`` (``N``) is in PACKS; with offline packing one dataset row is one
+        pack, so each epoch runs ``ceil(num_packs / N)`` optimizer steps in BOTH pad modes, and
+        every real pack trains exactly once. The first ``num_packs // N`` steps are full
+        ``N``-pack global batches; the modes differ only in the trailing partial batch:
+          * ``pack_last_batch_pad="dp"`` (default): pad up to dp-divisibility only -- the final
+            step is ``ceil(rem/dp)*dp`` packs (``ceil(P/dp)*dp - P`` total dummies, minimal).
+          * ``pack_last_batch_pad="global"``: pad up to a full ``N`` packs -- the final step is
+            ``N`` packs (``ceil(P/N)*N - P`` total dummies, Megatron-style uniform N).
+        ``P < N`` just yields a single step.
+        """
+        gbs = self.finetuning_args.global_batch_size_in_packs
+        pad_mode = getattr(self.finetuning_args, "pack_last_batch_pad", "dp")
+        num_packs = len(self.train_dataset) if self.train_dataset is not None else 0
+        if num_packs == 0:
+            raise ValueError(
+                "Pack-counted `global_batch_size_in_packs` is set but the packed dataset is empty "
+                "(0 packs): no optimizer step can run. Check the dataset path / packing."
+            )
+        if not getattr(self, "_pack_counted_logged", False):
+            dp_size = self._effective_dp_size()
+            steps = math.ceil(num_packs / gbs)
+            rem = num_packs % gbs
+            pad_multiple = gbs if pad_mode == "global" else dp_size
+            dummies = math.ceil(num_packs / pad_multiple) * pad_multiple - num_packs  # 0 when divisible
+            if rem == 0:
+                last_desc = f"last step full ({gbs} packs), no dummies"
+            elif pad_mode == "global":
+                last_desc = f"last step padded to a full {gbs} packs ({rem} real + {gbs - rem} dummy)"
+            else:
+                last_size = math.ceil(rem / dp_size) * dp_size
+                last_desc = f"last step {last_size} packs ({rem} real + {last_size - rem} dummy, dp-minimal)"
+            logger.info_rank0(
+                f"Pack-counted global batch: global_batch_size_in_packs={gbs} packs = "
+                f"gradient_accumulation_steps({self.args.gradient_accumulation_steps}) * dp_size({dp_size}) "
+                f"* per_device_train_batch_size({self.args.per_device_train_batch_size}); "
+                f"num_packs={num_packs} -> {steps} step(s)/epoch; pack_last_batch_pad='{pad_mode}' "
+                f"({dummies} total all-ignore dummy pad pack(s); {last_desc}); "
+                "every sample trained exactly once per epoch."
+            )
+            self._pack_counted_logged = True
 
     def get_train_dataloader(self):
+        if self.finetuning_args.global_batch_size_in_packs is not None:
+            self._validate_and_log_pack_counted()
+
         spec = self._dist_sharding_spec()
         use_dummy = self._needs_dummy_pad(spec)
 
         # The native (accelerate-prepared) dataloader is used ONLY when no manual
         # DistributedSampler will be injected (spec is None): HF's default
         # RandomSampler / SequentialSampler, which accelerate shards exactly once.
-        # Any manually-sharded case -- CP>1 OR disable_shuffling across a distributed
-        # world -- must use the raw DataLoader below, because _get_train_sampler
-        # injects an explicit DistributedSampler and routing that through
-        # accelerator.prepare would let BatchSamplerShard re-shard it a second time
-        # (double sharding -> each rank sees only len(dataset)/world^2 samples). The
-        # raw path also lets the sampler emit the all-ignore dummy index (method 1)
-        # for the remainder case instead of duplicating a real pack from the front.
+        # Any manually-sharded case -- CP>1, disable_shuffling, OR the pack-counted
+        # global_batch_size_in_packs feature across a distributed world -- must use the raw
+        # DataLoader below, because _get_train_sampler injects an explicit
+        # DistributedSampler and routing that through accelerator.prepare would let
+        # BatchSamplerShard re-shard it a second time (double sharding -> each rank
+        # sees only len(dataset)/world^2 samples). The raw path also lets the sampler
+        # emit the all-ignore dummy index (method 1) for the remainder case instead of
+        # duplicating a real pack from the front.
         if spec is None and not use_dummy:
             return super().get_train_dataloader()
 
@@ -529,14 +637,20 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         if train_dataset is None:
             train_dataset = self.train_dataset
 
+        spec = self._dist_sharding_spec()
+
         # CP-aware / disable_shuffling sharding. CP shards across dp_size (CP peers
         # share a DP rank); disable_shuffling shards across the full world. When the
         # dataset is the dummy-padded wrapper, emit the all-ignore dummy index for
         # the padding slots; otherwise fall back to torch's DistributedSampler.
-        spec = self._dist_sharding_spec()
         if spec is not None:
             num_replicas, rank, do_shuffle = spec
             if isinstance(train_dataset, _AllIgnoreDummyDataset):
+                # pad-to-dp (default / general path) -> pad_to_multiple=None; pack-counted
+                # "global" mode -> pad the last partial batch up to a full N. `None` keeps
+                # the general dummy-pad path and the "dp" mode byte-identical.
+                pad_multiple = self._pack_pad_multiple(num_replicas)
+                pad_to_multiple = pad_multiple if pad_multiple != num_replicas else None
                 return _DummyPadDistributedSampler(
                     num_real=train_dataset.num_real,
                     num_replicas=num_replicas,
@@ -544,6 +658,7 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
                     dummy_index=train_dataset.dummy_index,
                     shuffle=do_shuffle,
                     seed=self.args.seed,
+                    pad_to_multiple=pad_to_multiple,
                 )
             return torch.utils.data.DistributedSampler(
                 train_dataset,

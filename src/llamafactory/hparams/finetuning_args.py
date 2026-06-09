@@ -579,6 +579,40 @@ class FinetuningArguments(
             )
         },
     )
+    global_batch_size_in_packs: int | None = field(
+        default=None,
+        metadata={
+            "help": (
+                "Pack-counted global batch size, measured in PACKS per optimizer step. REQUIRES "
+                "packing (`packing: true`, and `neat_packing: true` recommended): it counts the "
+                "global batch in packs, and with offline packing one dataset row == one pack. "
+                "Without packing each row is a single sample and there are no packs, so this is "
+                "rejected -- use `gradient_accumulation_steps` for a sample-counted batch instead. "
+                "When set, `gradient_accumulation_steps` is derived as "
+                "`global_batch_size_in_packs // (dp_size * per_device_train_batch_size)` "
+                "(requires `per_device_train_batch_size == 1` and exact divisibility), and the "
+                "trailing partial global batch keeps its real packs (padded with all-ignore dummy "
+                "packs; see `pack_last_batch_pad`) so each epoch runs `ceil(num_packs / "
+                "global_batch_size_in_packs)` steps and every sample is trained exactly once. Default "
+                "`None` keeps the standard implicit global batch (`micro * grad_accum * dp_size`)."
+            )
+        },
+    )
+    pack_last_batch_pad: Literal["dp", "global"] = field(
+        default="dp",
+        metadata={
+            "help": (
+                "How to pad the trailing partial global batch of the pack-counted "
+                "`global_batch_size_in_packs` feature (only meaningful when `global_batch_size_in_packs` "
+                "is set). `dp` (default): pad the last partial batch only up to dp-divisibility (minimal "
+                "all-ignore dummy packs; the final optimizer step is smaller, `ceil(rem/dp)*dp` "
+                "packs). `global`: pad it up to a full `global_batch_size_in_packs` packs (Megatron-style "
+                "uniform N; more dummies). Both modes run `ceil(num_packs / global_batch_size_in_packs)` "
+                "steps and train every real sample exactly once -- they differ only in dummy "
+                "count / final-step size. Default `dp` preserves the original behavior."
+            )
+        },
+    )
 
     def __post_init__(self):
         def split_arg(arg):
