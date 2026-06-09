@@ -372,10 +372,21 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
                     "need n_kv % cp == 0 OR cp % n_kv == 0 (the latter replicates KV heads)."
                 )
 
-            # Swap triton_gqa -> CP variant. Use varlen_ulysses when packing is active.
+            # Swap triton_gqa -> CP variant. Invariant: boundary-aware (cross-sample-safe)
+            # attention is COMPULSORY under CP. `block_diag_attn`/`neat_packing` on the
+            # collator means "this batch carries per-sample boundaries", which require the
+            # block-diagonal varlen kernel. The parser hard-errors on plain `packing`
+            # without `neat_packing` whenever CP is on (see `validate_cp_packing` in
+            # hparams/parser.py), so any packed batch that reaches training always has
+            # `neat_packing` boundaries and routes here. The non-varlen branch is therefore
+            # only the genuine no-packing case (one sample per sequence) where there are no
+            # boundaries to cross -- a cross-sample leak is impossible. No CP config sends
+            # packed data to the non-boundary-aware kernel.
             data_collator = kwargs.get("data_collator", None)
-            use_packing = getattr(data_collator, "neat_packing", False)
-            if use_packing:
+            varlen_needed = getattr(data_collator, "block_diag_attn", False) or getattr(
+                data_collator, "neat_packing", False
+            )
+            if varlen_needed:
                 from gemma_triton_flash_attn import register_triton_attention_varlen_ulysses
                 register_triton_attention_varlen_ulysses(self.cp_group, name="triton_gqa_varlen_ulysses")
                 attn_name = "triton_gqa_varlen_ulysses"
@@ -392,7 +403,7 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
 
             logger.info_rank0(
                 f"Context parallelism enabled: cp_size={cp}, dp_size={ws // cp}, "
-                f"attn_implementation={attn_name}, packing={use_packing}."
+                f"attn_implementation={attn_name}, block_diagonal_attn={varlen_needed}."
             )
 
     @override

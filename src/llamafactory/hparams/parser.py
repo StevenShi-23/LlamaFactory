@@ -334,6 +334,40 @@ def derive_pack_counted_grad_accum(
     return gbs // (dp_size * micro)
 
 
+def validate_cp_packing(context_parallel_size: int, packing: bool | None, neat_packing: bool) -> None:
+    """Reject plain ``packing`` under context parallelism: boundary-aware attention is COMPULSORY.
+
+    Under CP the attention runs through the Ulysses Triton kernels. The varlen
+    (block-diagonal) kernel masks cross-sample attention using per-sample
+    boundaries (``cu_seqlens``), but those boundaries are recovered from the
+    collated 2D attention mask -- which only carries sample ids when
+    ``neat_packing`` is on (``data/processor/supervised.py`` writes ``[1,1,2,2,..]``
+    for neat packing vs an all-ones ``[1,1,1,..]`` mask for plain packing). So
+    plain ``packing`` under CP has NO boundaries in the batch: every packed
+    sample would silently attend across the whole pack (cross-sample leak).
+
+    Therefore, whenever CP is on AND plain ``packing`` is requested WITHOUT
+    ``neat_packing``, this is REJECTED here at parse time (hard error) -- the
+    config is never silently rewritten. The user must set ``neat_packing: true``
+    (block-diagonal, recommended) or disable packing. Every other combination is
+    fine: any ``neat_packing`` config already carries boundaries, and the
+    no-packing case is one sample per sequence (no boundaries to cross, so no leak
+    is possible). Off CP (size <= 1) nothing is rejected -- the leak is a CP-only
+    concern.
+
+    Standalone/pure (no arg objects) so it is unit-testable without full argument parsing.
+    Raises ``ValueError`` on the leaky combination; returns ``None`` otherwise.
+    """
+    if int(context_parallel_size) > 1 and bool(packing) and not neat_packing:
+        raise ValueError(
+            "`context_parallel_size > 1` with `packing: true` requires `neat_packing: true`. "
+            "Plain packing produces an all-ones attention mask with no per-sample boundaries, so "
+            "the context-parallel attention kernel (triton_gqa_varlen_ulysses) cannot isolate "
+            "packed samples and would attend across sample boundaries (cross-sample contamination). "
+            "Set `neat_packing: true` (recommended) or disable packing."
+        )
+
+
 def get_train_args(args: dict[str, Any] | list[str] | None = None) -> _TRAIN_CLS:
     if is_env_enabled("USE_MCA"):
         model_args, data_args, training_args, finetuning_args, generating_args = _parse_train_mca_args(args)
@@ -460,6 +494,17 @@ def get_train_args(args: dict[str, Any] | list[str] | None = None) -> _TRAIN_CLS
             )
         if training_args.predict_with_generate:
             raise ValueError("`predict_with_generate` is not supported when `context_parallel_size > 1`.")
+
+        # Boundary-aware attention is COMPULSORY under CP. Plain `packing` carries no
+        # per-sample boundaries in the batch (all-ones attention mask), so under CP the
+        # Ulysses varlen kernel could not mask cross-sample attention -> packed samples
+        # would silently leak into each other. Reject the leaky combination here at parse
+        # time (hard error) instead of silently rewriting the user's config: `packing`
+        # without `neat_packing` under CP must become `neat_packing: true` (block-diagonal,
+        # which also turns on `block_diag_attn` below) or disable packing. No-packing is
+        # always fine (single sample per sequence -> nothing to leak across), as is any
+        # `neat_packing` config.
+        validate_cp_packing(cp, data_args.packing, data_args.neat_packing)
 
     if finetuning_args.global_batch_size_in_packs is not None:
         # Pack-counted global batch (in packs). Derive gradient_accumulation_steps HERE, at parse
