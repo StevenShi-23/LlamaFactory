@@ -645,6 +645,14 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         # the padding slots; otherwise fall back to torch's DistributedSampler.
         if spec is not None:
             num_replicas, rank, do_shuffle = spec
+            # Honor `data_seed` exactly like HF's native (accelerate) path so the
+            # custom manually-sharded loader shuffles identically. HF seeds its data
+            # sampler with `data_seed if data_seed is not None else seed` (the native
+            # cp=1 path resolves this via accelerate's SeedableRandomSampler /
+            # DataLoaderConfiguration.data_seed, whose docs read "If not set, ... use
+            # the same seed as `seed`"). Seeding the custom samplers with
+            # `self.args.seed` instead diverged from cp=1 whenever data_seed != seed.
+            effective_data_seed = self.args.data_seed if self.args.data_seed is not None else self.args.seed
             if isinstance(train_dataset, _AllIgnoreDummyDataset):
                 # pad-to-dp (default / general path) -> pad_to_multiple=None; pack-counted
                 # "global" mode -> pad the last partial batch up to a full N. `None` keeps
@@ -657,7 +665,7 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
                     rank=rank,
                     dummy_index=train_dataset.dummy_index,
                     shuffle=do_shuffle,
-                    seed=self.args.seed,
+                    seed=effective_data_seed,
                     pad_to_multiple=pad_to_multiple,
                 )
             return torch.utils.data.DistributedSampler(
@@ -665,7 +673,7 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
                 num_replicas=num_replicas,
                 rank=rank,
                 shuffle=do_shuffle,
-                seed=self.args.seed,
+                seed=effective_data_seed,
             )
 
         if self.finetuning_args.disable_shuffling:
