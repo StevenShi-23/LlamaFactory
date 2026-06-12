@@ -326,8 +326,11 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
 
         # Ulysses context parallelism (Gemma-4 long-context path).
         self.cp_group = None
-        self._cp_ce_sum_accum = 0.0
-        self._cp_valid_accum = 0
+        # Token-weighted global-CE accumulators (used by BOTH the non-CP and CP
+        # loss paths): each (dp,cp) rank/shard adds its LOCAL ce_sum + valid-token
+        # count over the GA window; log() world-SUM-reduces them into the logged loss.
+        self._ce_sum_accum = 0.0
+        self._valid_accum = 0.0
         self.cp_mesh = None
 
         # Per-step throughput logging (loss/grad_norm are already logged by HF;
@@ -412,10 +415,23 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
 
         import torch.distributed as dist
 
-        if self._cp_valid_accum > 0:
-            logs["global_ce"] = round(self._cp_ce_sum_accum / self._cp_valid_accum, 4)
-            self._cp_ce_sum_accum = 0.0
-            self._cp_valid_accum = 0
+        # Make the logged step loss the TRUE global per-token CE, invariant to
+        # (dp, cp, ga): world-SUM the locally-accumulated shard ce_sum + valid-token
+        # counts (each token counted exactly once -> no cp division) and overwrite
+        # HF's rank-averaged "loss" with it. Guarded by "loss" so the all-reduce is
+        # symmetric across ranks (the final train_runtime summary has no "loss" key)
+        # and cannot deadlock. Gradient path (_scale_loss) is untouched.
+        if "loss" in logs:
+            ce_t = torch.tensor(
+                [self._ce_sum_accum, self._valid_accum], device=self.accelerator.device
+            )
+            if dist.is_available() and dist.is_initialized():
+                dist.all_reduce(ce_t, op=dist.ReduceOp.SUM)
+            true_ce = (ce_t[0] / ce_t[1].clamp_min(1.0)).item()
+            logs["global_ce"] = round(true_ce, 4)
+            logs["loss"] = round(true_ce, 4)
+            self._ce_sum_accum = 0.0
+            self._valid_accum = 0.0
 
         # Per-step wall time + throughput. Only on training-step logs (which carry
         # "loss"); skip the final summary log so step_time isn't polluted by the
@@ -847,6 +863,10 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
 
         disp = local_sum.detach() / weights.sum().clamp_min(1.0)  # token/sample-mean CE for logging
         loss = self._scale_loss(local_sum, num_items, display_value=disp)
+        # Accumulate LOCAL ce_sum + valid-token count for the world-reduced global_ce
+        # logged in log() (per_token: local_sum == sum_t ce_t, weights.sum() == #valid).
+        self._ce_sum_accum += float(local_sum.detach())
+        self._valid_accum += float(weights.sum())
         return (loss, outputs) if kwargs.get("return_outputs", False) else loss
 
     def _compute_loss_cp(self, model, inputs, *args, **kwargs):
@@ -1014,8 +1034,11 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
                 dist.all_reduce(global_ce_sum, op=dist.ReduceOp.SUM, group=self.cp_group)
                 dist.all_reduce(global_valid, op=dist.ReduceOp.SUM, group=self.cp_group)
                 global_ce = global_ce_sum / global_valid.clamp_min(1.0)
-            self._cp_ce_sum_accum += global_ce_sum.item()
-            self._cp_valid_accum += int(global_valid.item())
+            # Accumulate the LOCAL (pre-cp-reduce) shard ce_sum + valid count; the
+            # world SUM all-reduce in log() counts every token once across (dp x cp),
+            # so NO cp division is applied here.
+            self._ce_sum_accum += float(local_ce_sum.detach())
+            self._valid_accum += float(local_valid)
 
             num_items = kwargs.get("num_items_in_batch", None)
             loss = self._scale_loss(local_weighted_sum, num_items, display_value=global_ce)
